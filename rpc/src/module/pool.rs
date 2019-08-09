@@ -1,13 +1,10 @@
 use crate::error::RPCError;
 use ckb_core::transaction::Transaction as CoreTransaction;
 use ckb_jsonrpc_types::{Timestamp, Transaction, TxPoolInfo, Unsigned};
-use ckb_logger::error;
-use ckb_network::NetworkController;
-use ckb_protocol::RelayMessage;
+use ckb_network::PeerIndex;
 use ckb_shared::shared::Shared;
-use ckb_sync::NetworkProtocol;
+use ckb_sync::SyncSharedState;
 use ckb_tx_pool_executor::TxPoolExecutor;
-use flatbuffers::FlatBufferBuilder;
 use jsonrpc_core::Result;
 use jsonrpc_derive::rpc;
 use numext_fixed_hash::H256;
@@ -25,17 +22,17 @@ pub trait PoolRpc {
 }
 
 pub(crate) struct PoolRpcImpl {
-    network_controller: NetworkController,
+    sync_shared_state: Arc<SyncSharedState>,
     shared: Shared,
     tx_pool_executor: Arc<TxPoolExecutor>,
 }
 
 impl PoolRpcImpl {
-    pub fn new(shared: Shared, network_controller: NetworkController) -> PoolRpcImpl {
+    pub fn new(shared: Shared, sync_shared_state: Arc<SyncSharedState>) -> PoolRpcImpl {
         let tx_pool_executor = Arc::new(TxPoolExecutor::new(shared.clone()));
         PoolRpcImpl {
+            sync_shared_state,
             shared,
-            network_controller,
             tx_pool_executor,
         }
     }
@@ -48,19 +45,15 @@ impl PoolRpc for PoolRpcImpl {
         let result = self.tx_pool_executor.verify_and_add_tx_to_pool(tx.clone());
 
         match result {
-            Ok(cycles) => {
-                let fbb = &mut FlatBufferBuilder::new();
+            Ok(_) => {
+                // workaround: we are using `PeerIndex(usize::max)` to indicate that tx hash source is itself.
+                let peer_index = PeerIndex::new(usize::max_value());
                 let hash = tx.hash().to_owned();
-                let relay_tx = (tx, cycles);
-                let message = RelayMessage::build_transactions(fbb, &[relay_tx]);
-                fbb.finish(message, None);
-                let data = fbb.finished_data().into();
-                if let Err(err) = self
-                    .network_controller
-                    .broadcast(NetworkProtocol::RELAY.into(), data)
-                {
-                    error!("Broadcast transaction failed: {:?}", err);
-                }
+                self.sync_shared_state
+                    .tx_hashes()
+                    .entry(peer_index)
+                    .or_default()
+                    .insert(hash.clone());
                 Ok(hash)
             }
             Err(e) => Err(RPCError::custom(RPCError::Invalid, e.to_string())),
